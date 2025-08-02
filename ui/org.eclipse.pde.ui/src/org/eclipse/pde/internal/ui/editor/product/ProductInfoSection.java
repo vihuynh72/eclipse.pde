@@ -20,8 +20,12 @@ import static org.eclipse.pde.internal.core.iproduct.IProduct.ProductType.FEATUR
 import static org.eclipse.pde.internal.core.iproduct.IProduct.ProductType.MIXED;
 import static org.eclipse.swt.events.SelectionListener.widgetSelectedAdapter;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 
+import org.eclipse.core.runtime.IConfigurationElement;
 import org.eclipse.core.runtime.IExtension;
 import org.eclipse.core.runtime.IExtensionDelta;
 import org.eclipse.core.runtime.IRegistryChangeEvent;
@@ -32,6 +36,7 @@ import org.eclipse.jface.wizard.WizardDialog;
 import org.eclipse.osgi.service.resolver.State;
 import org.eclipse.osgi.service.resolver.StateDelta;
 import org.eclipse.pde.core.IModelChangedEvent;
+import org.eclipse.pde.core.plugin.IPluginModelBase;
 import org.eclipse.pde.core.plugin.TargetPlatform;
 import org.eclipse.pde.internal.build.IPDEBuildConstants;
 import org.eclipse.pde.internal.core.IStateDeltaListener;
@@ -44,6 +49,7 @@ import org.eclipse.pde.internal.ui.PDEUIMessages;
 import org.eclipse.pde.internal.ui.editor.FormLayoutFactory;
 import org.eclipse.pde.internal.ui.editor.PDEFormPage;
 import org.eclipse.pde.internal.ui.editor.PDESection;
+import org.eclipse.pde.internal.ui.launcher.LaunchAction;
 import org.eclipse.pde.internal.ui.parts.ComboPart;
 import org.eclipse.pde.internal.ui.wizards.product.ProductDefinitionWizard;
 import org.eclipse.swt.SWT;
@@ -178,6 +184,121 @@ public class ProductInfoSection extends PDESection implements IRegistryChangeLis
 
 	}
 
+	/**
+	 * Filters applications based on the plugins/bundles available in the
+	 * current product. This ensures that only applications from plugins
+	 * actually included in the product are shown in the application dropdown.
+	 *
+	 * @param product
+	 *            the current product configuration
+	 * @return a set of application IDs that are available for this product
+	 */
+	private Set<String> getAvailableApplicationsForProduct(IProduct product) {
+		Set<String> availablePluginIds = collectAvailablePluginIds(product);
+		Set<String> filteredApplications = new TreeSet<>();
+
+		// Find all registered applications
+		IExtension[] extensions = PDECore.getDefault().getExtensionsRegistry()
+				.findExtensions("org.eclipse.core.runtime.applications", true);
+
+		for (IExtension extension : extensions) {
+			String applicationId = extension.getUniqueIdentifier();
+			if (applicationId == null) {
+				continue;
+			}
+
+			// Check if application should be visible
+			if (!isApplicationVisible(extension)) {
+				continue;
+			}
+
+			// Check if the application's contributing plugin is available in
+			// the product
+			String contributorId = extension.getContributor().getName();
+			String namespaceId = extension.getNamespaceIdentifier();
+
+			if (availablePluginIds.contains(contributorId) || availablePluginIds.contains(namespaceId)) {
+				filteredApplications.add(applicationId);
+			}
+		}
+
+		// Always include the IDE workbench application as a fallback
+		filteredApplications.add("org.eclipse.ui.ide.workbench");
+
+		return filteredApplications;
+	}
+
+	/**
+	 * Collects all plugin IDs that are available/launched for the given
+	 * product.
+	 *
+	 * @param product
+	 *            the product configuration
+	 * @return set of available plugin IDs
+	 */
+	private Set<String> collectAvailablePluginIds(IProduct product) {
+		Set<String> pluginIds = new HashSet<>();
+
+		try {
+			Set<IPluginModelBase> launchedBundles = LaunchAction.getLaunchedBundlesForProduct(product);
+			for (IPluginModelBase model : launchedBundles) {
+				if (model != null && model.getPluginBase() != null) {
+					String id = model.getPluginBase().getId();
+					if (id != null) {
+						pluginIds.add(id);
+					}
+				}
+			}
+		} catch (Exception e) {
+			PDECore.log(e);
+			// Log error but continue with empty set - better than crashing
+		}
+
+		return pluginIds;
+	}
+
+	/**
+	 * Checks if an application extension should be visible in the dropdown.
+	 *
+	 * @param extension
+	 *            the application extension to check
+	 * @return true if the application should be visible, false otherwise
+	 */
+	private boolean isApplicationVisible(IExtension extension) {
+		IConfigurationElement[] elements = extension.getConfigurationElements();
+
+		// Applications should have exactly one configuration element
+		if (elements.length != 1) {
+			return false;
+		}
+
+		// Check the 'visible' attribute - if not specified, defaults to true
+		String visibleAttribute = elements[0].getAttribute("visible");
+		return visibleAttribute == null || Boolean.parseBoolean(visibleAttribute);
+	}
+
+	/**
+	 * Refreshes the application dropdown with filtered applications based on
+	 * the current product. Preserves the user's current selection if it's still
+	 * valid.
+	 */
+	private void refreshApplicationDropdown() {
+		if (fAppCombo == null) {
+			return;
+		}
+
+		String[] filteredApps = getAvailableApplicationsForProduct(getProduct()).toArray(new String[0]);
+		String currentSelection = fAppCombo.getSelection();
+
+		// Reload the combo with filtered applications
+		fAppCombo.reload(filteredApps);
+
+		// Restore the previous selection if it's still available
+		if (currentSelection != null && !currentSelection.isBlank() && fAppCombo.indexOf(currentSelection) != -1) {
+			fAppCombo.setText(currentSelection);
+		}
+	}
+
 	public ProductInfoSection(PDEFormPage page, Composite parent) {
 		super(page, parent, Section.DESCRIPTION);
 		createClient(getSection(), page.getEditor().getToolkit());
@@ -263,8 +384,11 @@ public class ProductInfoSection extends PDESection implements IRegistryChangeLis
 		GridData gd = new GridData(GridData.FILL_HORIZONTAL);
 		gd.horizontalSpan = NUM_COLUMNS - 1;
 		fAppCombo.getControl().setLayoutData(gd);
-		fAppCombo.setItems(TargetPlatform.getApplications());
+
+		// Use filtered applications instead of all available applications
+		refreshApplicationDropdown();
 		fAppCombo.add(""); //$NON-NLS-1$
+
 		fAppCombo.addSelectionListener(
 				widgetSelectedAdapter(e -> getProduct().setApplication(fAppCombo.getSelection())));
 		fAppCombo.getControl().addListener(SWT.MouseWheel, event -> {
@@ -364,6 +488,10 @@ public class ProductInfoSection extends PDESection implements IRegistryChangeLis
 		} else if (prop.equals(IProduct.P_APPLICATION)) {
 			fAppCombo.setText(e.getNewValue().toString());
 		}
+
+		// Auto-refresh application dropdown when model changes that might
+		// affect available applications
+		Display.getDefault().asyncExec(this::refreshApplicationDropdown);
 	}
 
 	private void handleModelEventWorldChanged() {
@@ -428,6 +556,8 @@ public class ProductInfoSection extends PDESection implements IRegistryChangeLis
 		Display.getDefault().asyncExec(() -> {
 			fAppCombo.handleExtensionDelta(applicationDeltas);
 			fProductCombo.handleExtensionDelta(productDeltas);
+			// Refresh filtered applications when registry changes
+			refreshApplicationDropdown();
 		});
 	}
 
@@ -446,6 +576,8 @@ public class ProductInfoSection extends PDESection implements IRegistryChangeLis
 		Display.getDefault().asyncExec(() -> {
 			fAppCombo.reload(finalApps);
 			fProductCombo.reload(finalProducts);
+			// Also refresh the filtered applications when state changes
+			refreshApplicationDropdown();
 		});
 	}
 
